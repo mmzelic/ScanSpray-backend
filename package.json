@@ -12,6 +12,7 @@
   "type": "commonjs",
   "dependencies": {
     "cors": "^2.8.6",
+    "csv-parser": "^3.2.0",
     "express": "^5.2.1",
     "modbus-serial": "^8.0.23",
     "socket.io": "^4.8.3"

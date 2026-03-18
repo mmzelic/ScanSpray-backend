@@ -4,7 +4,8 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const ModbusClient = require('modbus-serial');
 const config = require('./config');
-const { digital, analog } = require('../plc-frontend/src/plcDefinitions')
+const { digital, analog } = require('../plc-frontend/src/plcDefinitions');
+const csv = require('csv-parser');
 
 const PLC_IP = config.PLC_IP;
 const PLC_PORT = config.PLC_PORT;
@@ -25,6 +26,15 @@ const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
+const fs = require('fs');
+const path = require('path');
+
+
+
+// Logging State
+let cycleStartTime = null;
+let lastCycleCompleteState = false; 
+
 // Data Buffers
 let readBuffer = new Array(100).fill(0);  
 let lastReadBuffer = new Array(100).fill(0);
@@ -37,6 +47,16 @@ analog.forEach(item => {
         writeBuffer[item.reg] = item.min;
     }
 });
+
+
+// CSV File Path
+const logFilePath = path.join(__dirname, 'production_logs.csv');
+
+// Create the CSV header if the file doesn't exist
+if (!fs.existsSync(logFilePath)) {
+    const header = "Date,StartTime,EndTime,Duration(s),Program,Recipe,AtomAir,FanAir,FlowSP,Voltage,Speed,GunOpenTime\n";
+    fs.writeFileSync(logFilePath, header);
+}
 
 console.log(`[INIT] Write Buffer initialized with safety minimums.`);
 // Check Flow Setpoint (Reg 12) specifically in console to verify
@@ -80,6 +100,54 @@ const READ_NAMES = {
 
 const getTime = () => new Date().toLocaleTimeString();
 
+function processCycleLogging() {
+    // 1. Extract the current state of "Robot Cycle Complete" (Reg 250, Bit 1)
+    // Offset is 250 - 200 = 50 in your readBuffer logic
+    const currentCycleState = ((readBuffer[50] >> 1) & 1) === 1;
+
+    // 2. RISING EDGE: Cycle Started
+    if (currentCycleState === true && lastCycleCompleteState === false) {
+        cycleStartTime = new Date();
+        console.log(`[${getTime()}] >>> CYCLE STARTED - Timer Initialized`);
+    }
+
+    // 3. FALLING EDGE: Cycle Finished
+    if (currentCycleState === false && lastCycleCompleteState === true) {
+        const endTime = new Date();
+        const duration = cycleStartTime ? ((endTime - cycleStartTime) / 1000).toFixed(2) : 0;
+        
+        // Gather current setpoints from writeBuffer
+        const logData = {
+            date: endTime.toLocaleDateString(),
+            start: cycleStartTime ? cycleStartTime.toLocaleTimeString() : "N/A",
+            end: endTime.toLocaleTimeString(),
+            duration: duration,
+            prog: writeBuffer[41],
+            recipe: writeBuffer[20],
+            atom: writeBuffer[10],
+            fan: writeBuffer[11],
+            flow: writeBuffer[12],
+            voltage: writeBuffer[13],
+            speed: writeBuffer[40],
+            gunOpen: writeBuffer[43]
+        };
+
+        saveToCSV(logData);
+        cycleStartTime = null; // Reset timer
+    }
+
+    lastCycleCompleteState = currentCycleState;
+}
+
+function saveToCSV(data) {
+    const row = `${data.date},${data.start},${data.end},${data.duration},${data.prog},${data.recipe},${data.atom},${data.fan},${data.flow},${data.voltage},${data.speed},${data.gunOpen}\n`;
+    
+    fs.appendFile(logFilePath, row, (err) => {
+        if (err) console.error("Failed to save log:", err);
+        else console.log(`[${getTime()}] LOGGED: Cycle complete (${data.duration}s). Saved to production_logs.csv`);
+    });
+}
+
 // --- SIMULATION ENGINE ---
 function runSimulation() {
     // Fake a heartbeat toggle
@@ -97,6 +165,8 @@ function runSimulation() {
         isConnected = true;
         io.emit('connection_status', true);
     }
+
+    processCycleLogging();
 }
 
 // --- HELPER FUNCTION ---
@@ -130,6 +200,7 @@ async function commLoop() {
             const res = await client.readHoldingRegisters(200, 100);
             
             readBuffer = res.data;
+            processCycleLogging();
             io.emit('read_update', readBuffer);
             
             if (!isConnected) {
@@ -203,6 +274,23 @@ io.on('connection', (socket) => {
 });
 
 const PORT = 3001;
+
+// API to get logs
+app.get('/api/logs', (req, res) => {
+    const results = [];
+    if (!fs.existsSync(logFilePath)) {
+        return res.json([]); // Return empty if no file yet
+    }
+
+    fs.createReadStream(logFilePath)
+        .pipe(csv())
+        .on('data', (data) => results.push(data))
+        .on('end', () => {
+            // Send the last 50 logs so the page isn't too heavy
+            res.json(results.reverse().slice(0, 50));
+        });
+});
+
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`
     ===========================================
