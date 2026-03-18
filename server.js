@@ -26,9 +26,21 @@ const io = new Server(server, {
 });
 
 // Data Buffers
-let writeBuffer = new Array(100).fill(0); 
 let readBuffer = new Array(100).fill(0);  
 let lastReadBuffer = new Array(100).fill(0);
+
+// Initialize writeBuffer with 0s, then apply minimum values from definitions
+let writeBuffer = new Array(100).fill(0); 
+
+analog.forEach(item => {
+    if (item.min !== undefined) {
+        writeBuffer[item.reg] = item.min;
+    }
+});
+
+console.log(`[INIT] Write Buffer initialized with safety minimums.`);
+// Check Flow Setpoint (Reg 12) specifically in console to verify
+console.log(`[INIT] Register 12 (Flow SP) set to start at: ${writeBuffer[12]}`);
 
 console.log(`\n=========================================`);
 // Example Modbus connection block
@@ -174,11 +186,14 @@ io.on('connection', (socket) => {
     });
 
     socket.on('cmd_set_bit', ({ reg, bit, value }) => {
-        if (value === 1) {
-            writeBuffer[reg] |= (1 << bit); // Force bit HIGH
-        } else {
-            writeBuffer[reg] &= ~(1 << bit); // Force bit LOW
-        }
+        // ADD THIS GUARD HERE TOO
+    if (!isConnected && !SIMULATION_MODE) return;
+
+    if (value === 1) {
+        writeBuffer[reg] |= (1 << bit); 
+    } else {
+        writeBuffer[reg] &= ~(1 << bit); 
+    }
         
         const signalName = getWriteName(reg, bit);
         console.log(`[${getTime()}] [PULSE] -> ${signalName} set to ${value === 1 ? 'HIGH' : 'LOW'}`);
