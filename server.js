@@ -185,18 +185,32 @@ function getWriteName(reg, bit = null) {
 async function commLoop() {
     if (SIMULATION_MODE) {
         runSimulation();
-    } else {
-        try {
-            if (!client.isOpen) {
-                await client.connectTCP(PLC_IP, { port: PLC_PORT });
-                client.setID(PLC_UNIT_ID);
-                client.setTimeout(2000);
-                console.log(`[${getTime()}] Connected to Hardware PLC at ${PLC_IP}`);
-            }
+        setTimeout(commLoop, POLL_RATE); // Continue loop
+        return;
+    }
 
-            // Sync Buffers
+    try {
+        // 1. Connection Guard
+        if (!client.isOpen) {
+            isConnected = false;
+            io.emit('connection_status', false);
+            
+            console.log(`[${getTime()}] Attempting to reach PLC at ${PLC_IP}...`);
+            await client.connectTCP(PLC_IP, { port: PLC_PORT });
+            client.setID(PLC_UNIT_ID);
+            client.setTimeout(2000);
+            console.log(`[${getTime()}] Connected to Hardware PLC.`);
+        }
+
+        // 2. Double-Check Open state before writing
+        if (client.isOpen) {
+            // Write Setpoints
             await client.writeRegisters(0, writeBuffer);
+            
+            // Small pause between Write and Read to prevent collision
             await new Promise(r => setTimeout(r, 50));
+            
+            // Read Feedback
             const res = await client.readHoldingRegisters(200, 100);
             
             readBuffer = res.data;
@@ -207,14 +221,32 @@ async function commLoop() {
                 isConnected = true;
                 io.emit('connection_status', true);
             }
-        } catch (err) {
-            if (isConnected) console.log(`[${getTime()}] PLC Disconnected: ${err.message}`);
-            isConnected = false;
-            io.emit('connection_status', false);
-            try { client.close(); } catch(e) {}
         }
+        
+        // Success: Continue at normal POLL_RATE
+        setTimeout(commLoop, POLL_RATE);
+
+    } catch (err) {
+        // 3. Graceful Error Handling
+        if (isConnected) {
+            console.error(`[${getTime()}] PLC Comm Error: ${err.message}`);
+        }
+        
+        isConnected = false;
+        io.emit('connection_status', false);
+
+        // Force close the broken socket so we can start fresh
+        try { 
+            client.close(); 
+        } catch(e) {
+            // Ignore close errors
+        }
+
+        // 4. IMPORTANT: Wait longer on error (5s) before retrying 
+        // This prevents the "Write After End" crash
+        console.log(`[${getTime()}] Retrying in 5 seconds...`);
+        setTimeout(commLoop, 5000); 
     }
-    setTimeout(commLoop, POLL_RATE);
 }
 
 commLoop();
