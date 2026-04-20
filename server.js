@@ -3,6 +3,7 @@ const http = require('http');
 const cors = require('cors');
 const { Server } = require('socket.io');
 const ModbusClient = require('modbus-serial');
+const { spawn } = require('child_process');
 const config = require('./config');
 const { digital, analog } = require('../plc-frontend/src/plcDefinitions');
 const csv = require('csv-parser');
@@ -33,7 +34,18 @@ const path = require('path');
 
 // Logging State
 let cycleStartTime = null;
-let lastCycleCompleteState = false; 
+let lastCycleCompleteState = false;
+let lastCapturedImageFile = '';
+
+// Zivid State
+let lastZividSnapshotState = null; // null = uninitialized; seeded on first read to avoid spurious trigger
+let captureInProgress = false;
+
+// Captures folder
+const captureDir = path.join(__dirname, config.ZIVID_CAPTURE_DIR || 'captures');
+if (!fs.existsSync(captureDir)) {
+    fs.mkdirSync(captureDir, { recursive: true });
+}
 
 // Data Buffers
 let readBuffer = new Array(100).fill(0);  
@@ -52,11 +64,46 @@ analog.forEach(item => {
 // CSV File Path
 const logFilePath = path.join(__dirname, 'production_logs.csv');
 
-// Create the CSV header if the file doesn't exist
+const CSV_HEADER = "TestNumber,Date,StartTime,EndTime,Duration(s),Program,Recipe,AtomAir,FanAir,FlowSP,Voltage,Speed,GunOpenTime,ImageFile";
+
+// Create or migrate the CSV
+let testCounter = 1;
+
 if (!fs.existsSync(logFilePath)) {
-    const header = "Date,StartTime,EndTime,Duration(s),Program,Recipe,AtomAir,FanAir,FlowSP,Voltage,Speed,GunOpenTime\n";
-    fs.writeFileSync(logFilePath, header);
+    fs.writeFileSync(logFilePath, CSV_HEADER + '\n');
+} else {
+    // Migrate: ensure header has all required columns, count rows for testCounter
+    const lines = fs.readFileSync(logFilePath, 'utf8').split('\n').filter(l => l.trim() !== '');
+    const currentHeader = lines[0] || '';
+
+    let needsRewrite = false;
+    let headerCols = currentHeader.split(',');
+
+    if (!currentHeader.includes('TestNumber')) {
+        headerCols = ['TestNumber', ...headerCols];
+        needsRewrite = true;
+    }
+    if (!currentHeader.includes('ImageFile')) {
+        headerCols = [...headerCols, 'ImageFile'];
+        needsRewrite = true;
+    }
+
+    if (needsRewrite) {
+        const newLines = [headerCols.join(',')];
+        for (let i = 1; i < lines.length; i++) {
+            const cols = lines[i].split(',');
+            if (!currentHeader.includes('TestNumber')) cols.unshift(String(i)); // prepend sequential number
+            if (!currentHeader.includes('ImageFile')) cols.push('');             // append empty ImageFile
+            newLines.push(cols.join(','));
+        }
+        fs.writeFileSync(logFilePath, newLines.join('\n') + '\n');
+        console.log(`[INIT] CSV migrated to add missing columns.`);
+    }
+
+    // Initialize counter from existing row count
+    testCounter = lines.length; // lines[0] is header, so length-1 data rows + 1 for next
 }
+console.log(`[INIT] Next test number: ${testCounter}`);
 
 console.log(`[INIT] Write Buffer initialized with safety minimums.`);
 // Check Flow Setpoint (Reg 12) specifically in console to verify
@@ -118,6 +165,7 @@ function processCycleLogging() {
         
         // Gather current setpoints from writeBuffer
         const logData = {
+            testNumber: testCounter,
             date: endTime.toLocaleDateString(),
             start: cycleStartTime ? cycleStartTime.toLocaleTimeString() : "N/A",
             end: endTime.toLocaleTimeString(),
@@ -129,23 +177,102 @@ function processCycleLogging() {
             flow: writeBuffer[12],
             voltage: writeBuffer[13],
             speed: writeBuffer[40],
-            gunOpen: writeBuffer[43]
+            gunOpen: writeBuffer[43],
+            imageFile: lastCapturedImageFile
         };
 
         saveToCSV(logData);
-        cycleStartTime = null; // Reset timer
+        testCounter++;
+        cycleStartTime = null;
+        lastCapturedImageFile = '';
     }
 
     lastCycleCompleteState = currentCycleState;
 }
 
 function saveToCSV(data) {
-    const row = `${data.date},${data.start},${data.end},${data.duration},${data.prog},${data.recipe},${data.atom},${data.fan},${data.flow},${data.voltage},${data.speed},${data.gunOpen}\n`;
+    const row = `${data.testNumber},${data.date},${data.start},${data.end},${data.duration},${data.prog},${data.recipe},${data.atom},${data.fan},${data.flow},${data.voltage},${data.speed},${data.gunOpen},${data.imageFile || ''}\n`;
     
     fs.appendFile(logFilePath, row, (err) => {
         if (err) console.error("Failed to save log:", err);
         else console.log(`[${getTime()}] LOGGED: Cycle complete (${data.duration}s). Saved to production_logs.csv`);
     });
+}
+
+// --- ZIVID CAPTURE ---
+function triggerZividCapture() {
+    if (captureInProgress) {
+        console.warn(`[${getTime()}] [ZIVID] Capture already in progress, ignoring trigger`);
+        return;
+    }
+    captureInProgress = true;
+
+    // Build filename: capture_YYYYMMDD_HHMMSS_progN_recipeR.png
+    const now = new Date();
+    const ts = now.toISOString().replace(/[-:.TZ]/g, '').slice(0, 15);
+    const prog = writeBuffer[41];
+    const recipe = writeBuffer[20];
+    const fileName = `capture_${ts}_prog${prog}_recipe${recipe}.png`;
+    const filePath = path.join(captureDir, fileName);
+
+    console.log(`[${getTime()}] [ZIVID] Triggering capture → ${fileName}`);
+
+    // Inject Zivid DLL directory into PATH so the C extension can load
+    const spawnEnv = { ...process.env };
+    if (config.ZIVID_DLL_DIR) {
+        spawnEnv.PATH = `${config.ZIVID_DLL_DIR};${spawnEnv.PATH || ''}`;
+    }
+
+    const proc = spawn(config.ZIVID_PYTHON_BIN || 'python', [
+        path.join(__dirname, config.ZIVID_SCRIPT),
+        filePath,
+        config.ZIVID_IP
+    ], { env: spawnEnv });
+
+    proc.stdout.on('data', (d) => console.log(`[ZIVID] ${d.toString().trim()}`));
+    proc.stderr.on('data', (d) => console.error(`[ZIVID] ERR: ${d.toString().trim()}`));
+
+    proc.on('error', (err) => {
+        captureInProgress = false;
+        console.error(`[${getTime()}] [ZIVID] Failed to start process: ${err.message}`);
+    });
+
+    proc.on('close', (code) => {
+        captureInProgress = false;
+        if (code === 0) {
+            lastCapturedImageFile = fileName;
+            console.log(`[${getTime()}] [ZIVID] Capture SUCCESS → ${fileName}`);
+            // Signal robot: Zivid Image Captured (reg 42, bit 7) = ON
+            writeBuffer[42] |= (1 << 7);
+            io.emit('write_update', [...writeBuffer]);
+        } else {
+            console.error(`[${getTime()}] [ZIVID] Capture FAILED (exit code ${code})`);
+        }
+    });
+}
+
+function processZividCapture() {
+    // addr 250 → readBuffer index 50, bit 3
+    const currentState = ((readBuffer[50] >> 3) & 1) === 1;
+
+    // Seed on first read — prevents spurious trigger if bit is already HIGH at startup
+    if (lastZividSnapshotState === null) {
+        lastZividSnapshotState = currentState;
+        return;
+    }
+
+    // Rising edge: trigger capture
+    if (currentState && !lastZividSnapshotState) {
+        triggerZividCapture();
+    }
+
+    // Falling edge: clear the Image Captured feedback bit
+    if (!currentState && lastZividSnapshotState) {
+        writeBuffer[42] &= ~(1 << 7);
+        io.emit('write_update', [...writeBuffer]);
+    }
+
+    lastZividSnapshotState = currentState;
 }
 
 // --- SIMULATION ENGINE ---
@@ -167,6 +294,7 @@ function runSimulation() {
     }
 
     processCycleLogging();
+    processZividCapture();
 }
 
 // --- HELPER FUNCTION ---
@@ -215,6 +343,7 @@ async function commLoop() {
             
             readBuffer = res.data;
             processCycleLogging();
+            processZividCapture();
             io.emit('read_update', readBuffer);
             
             if (!isConnected) {
@@ -306,6 +435,9 @@ io.on('connection', (socket) => {
 });
 
 const PORT = 3001;
+
+// Serve captured images
+app.use('/captures', express.static(captureDir));
 
 // API to get logs
 app.get('/api/logs', (req, res) => {
