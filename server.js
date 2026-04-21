@@ -40,6 +40,12 @@ let lastCapturedImageFile = '';
 // Zivid State
 let lastZividSnapshotState = null; // null = uninitialized; seeded on first read to avoid spurious trigger
 let captureInProgress = false;
+let pendingImageTestNumber = null; // Set when cycle ends while capture is still running
+
+// Zivid Daemon (persistent process — connects to camera once, accepts CAPTURE commands)
+let zividDaemon = null;
+let daemonReady = false;
+let daemonOutputBuffer = '';
 
 // Captures folder
 const captureDir = path.join(__dirname, config.ZIVID_CAPTURE_DIR || 'captures');
@@ -64,7 +70,7 @@ analog.forEach(item => {
 // CSV File Path
 const logFilePath = path.join(__dirname, 'production_logs.csv');
 
-const CSV_HEADER = "TestNumber,Date,StartTime,EndTime,Duration(s),Program,Recipe,AtomAir,FanAir,FlowSP,Voltage,Speed,GunOpenTime,ImageFile";
+const CSV_HEADER = "TestNumber,Date,StartTime,EndTime,Duration(s),Program,Recipe,AtomAir,FanAir,FlowSP,Voltage,Speed,GunOpenTime,Humidity,Temperature,ImageFile";
 
 // Create or migrate the CSV
 let testCounter = 1;
@@ -72,36 +78,34 @@ let testCounter = 1;
 if (!fs.existsSync(logFilePath)) {
     fs.writeFileSync(logFilePath, CSV_HEADER + '\n');
 } else {
-    // Migrate: ensure header has all required columns, count rows for testCounter
     const lines = fs.readFileSync(logFilePath, 'utf8').split('\n').filter(l => l.trim() !== '');
-    const currentHeader = lines[0] || '';
+    const currentCols = (lines[0] || '').split(',');
+    const expectedCols = CSV_HEADER.split(',');
+    const missingCols = expectedCols.filter(c => !currentCols.includes(c));
 
-    let needsRewrite = false;
-    let headerCols = currentHeader.split(',');
-
-    if (!currentHeader.includes('TestNumber')) {
-        headerCols = ['TestNumber', ...headerCols];
-        needsRewrite = true;
-    }
-    if (!currentHeader.includes('ImageFile')) {
-        headerCols = [...headerCols, 'ImageFile'];
-        needsRewrite = true;
-    }
-
-    if (needsRewrite) {
-        const newLines = [headerCols.join(',')];
+    if (missingCols.length > 0) {
+        console.log(`[INIT] CSV missing columns: ${missingCols.join(', ')} — migrating...`);
+        const newLines = [CSV_HEADER];
         for (let i = 1; i < lines.length; i++) {
-            const cols = lines[i].split(',');
-            if (!currentHeader.includes('TestNumber')) cols.unshift(String(i)); // prepend sequential number
-            if (!currentHeader.includes('ImageFile')) cols.push('');             // append empty ImageFile
-            newLines.push(cols.join(','));
+            if (!lines[i].trim()) continue;
+            const oldCols = lines[i].split(',');
+            // Remap each expected column from its old position; auto-fill missing ones
+            const newRow = expectedCols.map((col, colIdx) => {
+                const oldIdx = currentCols.indexOf(col);
+                if (oldIdx >= 0) return oldCols[oldIdx] || '';
+                if (col === 'TestNumber') return String(i); // sequential number for old rows
+                return '';
+            });
+            newLines.push(newRow.join(','));
         }
         fs.writeFileSync(logFilePath, newLines.join('\n') + '\n');
-        console.log(`[INIT] CSV migrated to add missing columns.`);
+        console.log(`[INIT] CSV migration complete.`);
+        // Re-read after rewrite
+        const reread = fs.readFileSync(logFilePath, 'utf8').split('\n').filter(l => l.trim() !== '');
+        testCounter = reread.length; // header + data rows, next = length
+    } else {
+        testCounter = lines.length;
     }
-
-    // Initialize counter from existing row count
-    testCounter = lines.length; // lines[0] is header, so length-1 data rows + 1 for next
 }
 console.log(`[INIT] Next test number: ${testCounter}`);
 
@@ -178,10 +182,17 @@ function processCycleLogging() {
             voltage: writeBuffer[13],
             speed: writeBuffer[40],
             gunOpen: writeBuffer[43],
+            humidity: readBuffer[60],    // addr 260 → buf index 60
+            temperature: readBuffer[61], // addr 261 → buf index 61
             imageFile: lastCapturedImageFile
         };
 
         saveToCSV(logData);
+        // If capture is still running, mark this test for retroactive image update
+        if (captureInProgress && !lastCapturedImageFile) {
+            pendingImageTestNumber = logData.testNumber;
+            console.log(`[${getTime()}] [ZIVID] Capture still in progress — will update Test #${logData.testNumber} when done`);
+        }
         testCounter++;
         cycleStartTime = null;
         lastCapturedImageFile = '';
@@ -191,7 +202,7 @@ function processCycleLogging() {
 }
 
 function saveToCSV(data) {
-    const row = `${data.testNumber},${data.date},${data.start},${data.end},${data.duration},${data.prog},${data.recipe},${data.atom},${data.fan},${data.flow},${data.voltage},${data.speed},${data.gunOpen},${data.imageFile || ''}\n`;
+    const row = `${data.testNumber},${data.date},${data.start},${data.end},${data.duration},${data.prog},${data.recipe},${data.atom},${data.fan},${data.flow},${data.voltage},${data.speed},${data.gunOpen},${data.humidity},${data.temperature},${data.imageFile || ''}\n`;
     
     fs.appendFile(logFilePath, row, (err) => {
         if (err) console.error("Failed to save log:", err);
@@ -199,15 +210,128 @@ function saveToCSV(data) {
     });
 }
 
-// --- ZIVID CAPTURE ---
+function updateCSVImageFile(testNumber, imageFile) {
+    try {
+        const content = fs.readFileSync(logFilePath, 'utf8');
+        const lines = content.split('\n');
+        const headerCols = lines[0].split(',');
+        const testIdx = headerCols.indexOf('TestNumber');
+        const imgIdx  = headerCols.indexOf('ImageFile');
+        if (testIdx === -1 || imgIdx === -1) return;
+
+        for (let i = 1; i < lines.length; i++) {
+            if (!lines[i].trim()) continue;
+            const cols = lines[i].split(',');
+            if (cols[testIdx]?.trim() === String(testNumber)) {
+                cols[imgIdx] = imageFile;
+                lines[i] = cols.join(',');
+                break;
+            }
+        }
+        fs.writeFileSync(logFilePath, lines.join('\n'));
+        console.log(`[${getTime()}] [ZIVID] Test #${testNumber} updated with image: ${imageFile}`);
+    } catch (err) {
+        console.error(`[${getTime()}] [ZIVID] CSV update failed: ${err.message}`);
+    }
+}
+
+// --- ZIVID DAEMON ---
+function handleDaemonLine(line) {
+    if (!line) return;
+
+    if (line === 'READY') {
+        daemonReady = true;
+        console.log(`[${getTime()}] [ZIVID] Daemon READY — camera connected`);
+        return;
+    }
+
+    if (line === 'CONNECTING') {
+        console.log(`[${getTime()}] [ZIVID] Daemon connecting to camera...`);
+        return;
+    }
+
+    if (line.startsWith('SAVED:')) {
+        const savedPath = line.slice(6);
+        const fileName = path.basename(savedPath);
+        captureInProgress = false;
+        console.log(`[${getTime()}] [ZIVID] Capture SUCCESS → ${fileName}`);
+
+        if (pendingImageTestNumber !== null) {
+            updateCSVImageFile(pendingImageTestNumber, fileName);
+            pendingImageTestNumber = null;
+        } else {
+            lastCapturedImageFile = fileName;
+        }
+        writeBuffer[42] |= (1 << 7);
+        io.emit('write_update', [...writeBuffer]);
+        return;
+    }
+
+    if (line.startsWith('ERROR:')) {
+        captureInProgress = false;
+        pendingImageTestNumber = null;
+        console.error(`[${getTime()}] [ZIVID] Capture ERROR: ${line.slice(6)}`);
+        return;
+    }
+
+    console.log(`[ZIVID] ${line}`);
+}
+
+function startZividDaemon() {
+    if (zividDaemon) return;
+
+    console.log(`[${getTime()}] [ZIVID] Starting persistent daemon...`);
+    const spawnEnv = { ...process.env };
+    if (config.ZIVID_DLL_DIR) {
+        spawnEnv.PATH = `${config.ZIVID_DLL_DIR};${spawnEnv.PATH || ''}`;
+    }
+
+    zividDaemon = spawn(config.ZIVID_PYTHON_BIN || 'python', [
+        path.join(__dirname, 'capture_zivid_daemon.py'),
+        config.ZIVID_IP
+    ], { env: spawnEnv });
+
+    daemonOutputBuffer = '';
+
+    zividDaemon.stdout.on('data', (chunk) => {
+        daemonOutputBuffer += chunk.toString();
+        const lines = daemonOutputBuffer.split('\n');
+        daemonOutputBuffer = lines.pop(); // keep incomplete last line
+        for (const line of lines) {
+            handleDaemonLine(line.trim());
+        }
+    });
+
+    zividDaemon.stderr.on('data', (d) => {
+        console.error(`[ZIVID] ERR: ${d.toString().trim()}`);
+    });
+
+    zividDaemon.on('error', (err) => {
+        console.error(`[${getTime()}] [ZIVID] Daemon process error: ${err.message}`);
+        zividDaemon = null;
+        daemonReady = false;
+    });
+
+    zividDaemon.on('close', (code) => {
+        console.log(`[${getTime()}] [ZIVID] Daemon exited (code ${code})`);
+        zividDaemon = null;
+        daemonReady = false;
+        captureInProgress = false;
+    });
+}
+
 function triggerZividCapture() {
     if (captureInProgress) {
         console.warn(`[${getTime()}] [ZIVID] Capture already in progress, ignoring trigger`);
         return;
     }
+    if (!daemonReady) {
+        console.warn(`[${getTime()}] [ZIVID] Daemon not ready — capture skipped`);
+        return;
+    }
+
     captureInProgress = true;
 
-    // Build filename: capture_YYYYMMDD_HHMMSS_progN_recipeR.png
     const now = new Date();
     const ts = now.toISOString().replace(/[-:.TZ]/g, '').slice(0, 15);
     const prog = writeBuffer[41];
@@ -216,39 +340,7 @@ function triggerZividCapture() {
     const filePath = path.join(captureDir, fileName);
 
     console.log(`[${getTime()}] [ZIVID] Triggering capture → ${fileName}`);
-
-    // Inject Zivid DLL directory into PATH so the C extension can load
-    const spawnEnv = { ...process.env };
-    if (config.ZIVID_DLL_DIR) {
-        spawnEnv.PATH = `${config.ZIVID_DLL_DIR};${spawnEnv.PATH || ''}`;
-    }
-
-    const proc = spawn(config.ZIVID_PYTHON_BIN || 'python', [
-        path.join(__dirname, config.ZIVID_SCRIPT),
-        filePath,
-        config.ZIVID_IP
-    ], { env: spawnEnv });
-
-    proc.stdout.on('data', (d) => console.log(`[ZIVID] ${d.toString().trim()}`));
-    proc.stderr.on('data', (d) => console.error(`[ZIVID] ERR: ${d.toString().trim()}`));
-
-    proc.on('error', (err) => {
-        captureInProgress = false;
-        console.error(`[${getTime()}] [ZIVID] Failed to start process: ${err.message}`);
-    });
-
-    proc.on('close', (code) => {
-        captureInProgress = false;
-        if (code === 0) {
-            lastCapturedImageFile = fileName;
-            console.log(`[${getTime()}] [ZIVID] Capture SUCCESS → ${fileName}`);
-            // Signal robot: Zivid Image Captured (reg 42, bit 7) = ON
-            writeBuffer[42] |= (1 << 7);
-            io.emit('write_update', [...writeBuffer]);
-        } else {
-            console.error(`[${getTime()}] [ZIVID] Capture FAILED (exit code ${code})`);
-        }
-    });
+    zividDaemon.stdin.write(`CAPTURE ${filePath}\n`);
 }
 
 function processZividCapture() {
@@ -379,6 +471,7 @@ async function commLoop() {
 }
 
 commLoop();
+startZividDaemon();
 
 // --- WEBSOCKET EVENT LISTENERS ---
 io.on('connection', (socket) => {
@@ -437,7 +530,15 @@ io.on('connection', (socket) => {
 const PORT = 3001;
 
 // Serve captured images
-app.use('/captures', express.static(captureDir));
+app.get('/captures/:filename', (req, res) => {
+    const filePath = path.join(captureDir, req.params.filename);
+    if (fs.existsSync(filePath)) {
+        res.sendFile(filePath);
+    } else {
+        console.warn(`[CAPTURES] File not found: ${filePath}`);
+        res.status(404).json({ error: 'Image not found', path: filePath });
+    }
+});
 
 // API to get logs
 app.get('/api/logs', (req, res) => {
